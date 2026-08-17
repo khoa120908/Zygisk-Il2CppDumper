@@ -50,7 +50,7 @@ void metadata_recovery_worker(const char *game_data_dir) {
 }
 
 void hack_start(const char *game_data_dir) {
-    LOGI("v1.4.0-range-dump runtime start");
+    LOGI("v1.4.1-range-dump-buildfix runtime start");
     bool load = false;
     for (int i = 0; i < 60; i++) {
         void *handle = xdl_open("libil2cpp.so", 0);
@@ -87,7 +87,7 @@ void hack_start(const char *game_data_dir) {
 
 std::string GetLibDir(JavaVM *vms) {
     JNIEnv *env = nullptr;
-    vms->AttachCurrentThread(reinterpret_cast<void **>(&env), nullptr);
+    vms->AttachCurrentThread(&env, nullptr);
     jclass activity_thread_clz = env->FindClass("android/app/ActivityThread");
     if (activity_thread_clz != nullptr) {
         jmethodID currentApplicationId = env->GetStaticMethodID(activity_thread_clz,
