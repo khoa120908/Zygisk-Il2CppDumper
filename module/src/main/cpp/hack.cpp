@@ -4,40 +4,90 @@
 
 #include "hack.h"
 #include "il2cpp_dump.h"
+#include "metadata_dump.h"
 #include "log.h"
 #include "xdl.h"
 #include <cstring>
 #include <cstdio>
 #include <unistd.h>
 #include <sys/system_properties.h>
+#include <android/api-level.h>
 #include <dlfcn.h>
 #include <jni.h>
 #include <thread>
 #include <sys/mman.h>
 #include <linux/unistd.h>
 #include <array>
+#include <string>
+
+bool has_core_il2cpp_exports(void *handle) {
+    if (!handle) return false;
+    const char *required[] = {
+            "il2cpp_domain_get_assemblies",
+            "il2cpp_domain_get",
+            "il2cpp_thread_attach",
+            "il2cpp_is_vm_thread"
+    };
+    bool ok = true;
+    for (const char *name: required) {
+        if (!xdl_sym(handle, name, nullptr)) {
+            LOGW("required api not found %s", name);
+            ok = false;
+        }
+    }
+    return ok;
+}
+
+void metadata_recovery_worker(const char *game_data_dir) {
+    // Metadata may only become readable after IL2CPP has initialized/decrypted it.
+    // Keep this independent from exported il2cpp_* APIs so protected builds still get ranges.
+    constexpr int delays[] = {0, 3, 7};
+    for (int delay: delays) {
+        if (delay) sleep(delay);
+        if (dump_global_metadata(game_data_dir)) return;
+    }
+    LOGW("metadata recovery: no standard candidate after retries; check dump_info.txt for manual ranges");
+}
 
 void hack_start(const char *game_data_dir) {
+    LOGI("v1.4.0-range-dump runtime start");
     bool load = false;
-    for (int i = 0; i < 10; i++) {
+    for (int i = 0; i < 60; i++) {
         void *handle = xdl_open("libil2cpp.so", 0);
         if (handle) {
             load = true;
-            il2cpp_api_init(handle);
-            il2cpp_dump(game_data_dir);
+
+            // Always save mappings first. This path works even if all il2cpp_* exports are stripped.
+            save_runtime_ranges(game_data_dir);
+            std::thread metadata_thread(metadata_recovery_worker, game_data_dir);
+            metadata_thread.detach();
+
+            // Keep the original dumper unchanged, but do not enter it when the APIs it
+            // immediately dereferences are unavailable (the protected-build case in the log).
+            if (has_core_il2cpp_exports(handle)) {
+                il2cpp_api_init(handle);
+                il2cpp_dump(game_data_dir);
+            } else {
+                LOGW("IL2CPP core exports unavailable; normal dump.cs skipped safely. Use dump_info.txt/global-metadata.dat for manual dump.");
+            }
             break;
-        } else {
-            sleep(1);
         }
+        if ((i % 5) == 0) {
+            LOGI("waiting for libil2cpp.so (%d/60)", i + 1);
+        }
+        sleep(1);
     }
     if (!load) {
         LOGI("libil2cpp.so not found in thread %d", gettid());
+        save_runtime_ranges(game_data_dir);
+        std::thread metadata_thread(metadata_recovery_worker, game_data_dir);
+        metadata_thread.detach();
     }
 }
 
 std::string GetLibDir(JavaVM *vms) {
     JNIEnv *env = nullptr;
-    vms->AttachCurrentThread(&env, nullptr);
+    vms->AttachCurrentThread(reinterpret_cast<void **>(&env), nullptr);
     jclass activity_thread_clz = env->FindClass("android/app/ActivityThread");
     if (activity_thread_clz != nullptr) {
         jmethodID currentApplicationId = env->GetStaticMethodID(activity_thread_clz,
