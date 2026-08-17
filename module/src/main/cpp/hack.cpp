@@ -5,6 +5,7 @@
 #include "hack.h"
 #include "il2cpp_dump.h"
 #include "metadata_dump.h"
+#include "runtime_dump.h"
 #include "log.h"
 #include "xdl.h"
 #include <cstring>
@@ -38,37 +39,41 @@ bool has_core_il2cpp_exports(void *handle) {
     return ok;
 }
 
-void metadata_recovery_worker(const char *game_data_dir) {
-    // Metadata may only become readable after IL2CPP has initialized/decrypted it.
-    // Keep this independent from exported il2cpp_* APIs so protected builds still get ranges.
-    constexpr int delays[] = {0, 3, 7};
-    for (int delay: delays) {
-        if (delay) sleep(delay);
-        if (dump_global_metadata(game_data_dir)) return;
+void runtime_dump_worker(const char *game_data_dir) {
+    // Give the loader/protector a little time to finish relocations and runtime patching.
+    sleep(3);
+    save_runtime_ranges(game_data_dir);
+
+    // Keep metadata exactly as the backing file. No header repair/decode in this path.
+    if (!copy_backing_global_metadata(game_data_dir)) {
+        LOGW("raw metadata copy failed");
     }
-    LOGW("metadata recovery: no standard candidate after retries; check dump_info.txt for manual ranges");
+
+    // Reconstruct libil2cpp twice:
+    //  - libil2cpp.memory.so: RAM mappings only, placed at ELF file offsets.
+    //  - libil2cpp.runtime.so: backing file with readable RAM mappings overlaid.
+    if (!dump_runtime_libil2cpp(game_data_dir)) {
+        LOGW("runtime libil2cpp reconstruction failed; check runtime_dump_info.txt/logcat");
+    }
 }
 
 void hack_start(const char *game_data_dir) {
-    LOGI("v1.4.1-range-dump-buildfix runtime start");
+    LOGI("v1.5.0-runtime-rebuild runtime start");
     bool load = false;
     for (int i = 0; i < 60; i++) {
         void *handle = xdl_open("libil2cpp.so", 0);
         if (handle) {
             load = true;
 
-            // Always save mappings first. This path works even if all il2cpp_* exports are stripped.
             save_runtime_ranges(game_data_dir);
-            std::thread metadata_thread(metadata_recovery_worker, game_data_dir);
-            metadata_thread.detach();
+            std::thread runtime_thread(runtime_dump_worker, game_data_dir);
+            runtime_thread.detach();
 
-            // Keep the original dumper unchanged, but do not enter it when the APIs it
-            // immediately dereferences are unavailable (the protected-build case in the log).
             if (has_core_il2cpp_exports(handle)) {
                 il2cpp_api_init(handle);
                 il2cpp_dump(game_data_dir);
             } else {
-                LOGW("IL2CPP core exports unavailable; normal dump.cs skipped safely. Use dump_info.txt/global-metadata.dat for manual dump.");
+                LOGW("IL2CPP core exports unavailable; normal dump.cs skipped safely. Runtime lib dump will continue in background thread.");
             }
             break;
         }
@@ -80,8 +85,6 @@ void hack_start(const char *game_data_dir) {
     if (!load) {
         LOGI("libil2cpp.so not found in thread %d", gettid());
         save_runtime_ranges(game_data_dir);
-        std::thread metadata_thread(metadata_recovery_worker, game_data_dir);
-        metadata_thread.detach();
     }
 }
 
@@ -144,7 +147,6 @@ struct NativeBridgeCallbacks {
     void *initialize;
 
     void *(*loadLibrary)(const char *libpath, int flag);
-
     void *(*getTrampoline)(void *handle, const char *name, const char *shorty, uint32_t len);
 
     void *isSupported;
@@ -162,7 +164,6 @@ struct NativeBridgeCallbacks {
 };
 
 bool NativeBridgeLoad(const char *game_data_dir, int api_level, void *data, size_t length) {
-    //TODO 等待houdini初始化
     sleep(5);
 
     auto libart = dlopen("libart.so", RTLD_NOW);
