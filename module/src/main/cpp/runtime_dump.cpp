@@ -11,6 +11,7 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <unistd.h>
+#include <utility>
 #include <vector>
 
 #include "log.h"
@@ -127,32 +128,51 @@ bool atomic_rename(const std::string &tmp, const std::string &final_path) {
     return false;
 }
 
+bool open_existing_file(const std::string &map_path, std::string *resolved_path,
+                        struct stat *st, int *fd) {
+    std::vector<std::string> candidates;
+    candidates.push_back(map_path);
+    const std::string media_prefix = "/data/media/0/";
+    if (map_path.rfind(media_prefix, 0) == 0) {
+        candidates.push_back("/storage/emulated/0/" + map_path.substr(media_prefix.size()));
+    }
+
+    for (const auto &candidate : candidates) {
+        struct stat local_st{};
+        if (stat(candidate.c_str(), &local_st) != 0 || local_st.st_size <= 0) continue;
+        int local_fd = open(candidate.c_str(), O_RDONLY | O_CLOEXEC);
+        if (local_fd < 0) continue;
+        if (resolved_path) *resolved_path = candidate;
+        if (st) *st = local_st;
+        if (fd) *fd = local_fd;
+        else close(local_fd);
+        return true;
+    }
+    return false;
+}
+
 }  // namespace
 
 bool copy_backing_global_metadata(const char *out_dir) {
     if (!ensure_output_dir(out_dir)) return false;
     auto maps = read_maps();
-    std::string source;
+    std::string map_path;
     for (const auto &m : maps) {
         if (m.path.find("global-metadata.dat") != std::string::npos) {
-            source = m.path;
+            map_path = m.path;
             break;
         }
     }
-    if (source.empty()) {
+    if (map_path.empty()) {
         LOGW("raw metadata: no named global-metadata.dat mapping found");
         return false;
     }
 
+    std::string source;
     struct stat st{};
-    if (stat(source.c_str(), &st) != 0 || st.st_size <= 0) {
-        LOGW("raw metadata: stat %s failed: %s", source.c_str(), strerror(errno));
-        return false;
-    }
-
-    int src = open(source.c_str(), O_RDONLY | O_CLOEXEC);
-    if (src < 0) {
-        LOGW("raw metadata: open %s failed: %s", source.c_str(), strerror(errno));
+    int src = -1;
+    if (!open_existing_file(map_path, &source, &st, &src)) {
+        LOGW("raw metadata: backing file cannot be opened: %s", map_path.c_str());
         return false;
     }
 
@@ -179,8 +199,8 @@ bool copy_backing_global_metadata(const char *out_dir) {
         return false;
     }
 
-    LOGI("raw metadata copied unchanged: %s size=0x%" PRIx64,
-         final_path.c_str(), static_cast<uint64_t>(st.st_size));
+    LOGI("raw metadata copied unchanged: %s <- %s size=0x%" PRIx64,
+         final_path.c_str(), source.c_str(), static_cast<uint64_t>(st.st_size));
     return true;
 }
 
@@ -199,19 +219,20 @@ bool dump_runtime_libil2cpp(const char *out_dir) {
         return false;
     }
 
-    const MapEntry *primary = nullptr;
+    const MapEntry *primary_ptr = nullptr;
     for (const auto &m : segments) {
         if (m.file_offset != 0) continue;
-        if (!primary || m.size() > primary->size()) primary = &m;
+        if (!primary_ptr || m.size() > primary_ptr->size()) primary_ptr = &m;
     }
-    if (!primary) {
-        primary = &*std::max_element(segments.begin(), segments.end(),
-                                    [](const MapEntry &a, const MapEntry &b) {
-                                        return a.size() < b.size();
-                                    });
+    if (!primary_ptr) {
+        primary_ptr = &*std::max_element(segments.begin(), segments.end(),
+                                        [](const MapEntry &a, const MapEntry &b) {
+                                            return a.size() < b.size();
+                                        });
     }
+    const MapEntry primary = *primary_ptr;
 
-    std::string source = primary->path;
+    std::string source = primary.path;
     struct stat st{};
     uint64_t source_size = 0;
     if (!source.empty() && stat(source.c_str(), &st) == 0 && st.st_size > 0) {
@@ -273,18 +294,15 @@ bool dump_runtime_libil2cpp(const char *out_dir) {
     report << "SOURCE_SIZE=0x" << std::hex << source_size << "\n";
     report << "OUTPUT_SIZE=0x" << std::hex << output_size << "\n";
     report << "BACKING_COPIED=" << (backing_copied ? "YES" : "NO") << "\n";
-    report << "PRIMARY_MAP=0x" << std::hex << primary->start << "-0x" << primary->end
-           << " file_off=0x" << primary->file_offset << " " << primary->perms << "\n\n";
+    report << "PRIMARY_MAP=0x" << std::hex << primary.start << "-0x" << primary.end
+           << " file_off=0x" << primary.file_offset << " " << primary.perms << "\n\n";
 
-    // Start the pure-memory image from the largest offset-0 mapping. This avoids a
-    // smaller duplicate offset-0 mapping overwriting the full runtime image.
     uint64_t primary_written_mem = 0, primary_written_merged = 0;
-    dump_mem_range(mem_fd, mem_out, *primary, primary->file_offset, output_size, &primary_written_mem);
-    dump_mem_range(mem_fd, merged_out, *primary, primary->file_offset, output_size, &primary_written_merged);
-    report << "PRIMARY_WRITTEN=0x" << std::hex << primary_written_mem << "\n";
+    dump_mem_range(mem_fd, mem_out, primary, primary.file_offset, output_size, &primary_written_mem);
+    dump_mem_range(mem_fd, merged_out, primary, primary.file_offset, output_size, &primary_written_merged);
+    report << "PRIMARY_WRITTEN_MEMORY=0x" << std::hex << primary_written_mem << "\n";
+    report << "PRIMARY_WRITTEN_MERGED=0x" << std::hex << primary_written_merged << "\n";
 
-    // Overlay the remaining mapped segments by their ELF file offsets. Writable
-    // mappings are applied last so relocated/decrypted runtime data wins.
     std::stable_sort(segments.begin(), segments.end(), [](const MapEntry &a, const MapEntry &b) {
         if (a.writable != b.writable) return !a.writable && b.writable;
         if (a.file_offset != b.file_offset) return a.file_offset < b.file_offset;
@@ -293,9 +311,11 @@ bool dump_runtime_libil2cpp(const char *out_dir) {
 
     size_t index = 0;
     for (const auto &m : segments) {
-        if (&m == primary) continue;
-        if (m.file_offset == primary->file_offset && m.size() <= primary->size()) {
-            report << "SEGMENT[" << std::dec << index++ << "]=SKIP_DUP_OFFSET0 0x"
+        bool is_primary = m.start == primary.start && m.end == primary.end &&
+                          m.file_offset == primary.file_offset;
+        if (is_primary) continue;
+        if (m.file_offset == primary.file_offset && m.size() <= primary.size()) {
+            report << "SEGMENT[" << std::dec << index++ << "]=SKIP_DUP_PRIMARY_OFFSET 0x"
                    << std::hex << m.start << "-0x" << m.end << " size=0x" << m.size()
                    << " perms=" << m.perms << "\n";
             continue;
