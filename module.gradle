@@ -4,6 +4,6 @@ ext {
     moduleName = "Il2CppDumper"
     moduleAuthor = "Perfare"
     moduleDescription = "IL2CPP runtime dumper with memory range logging and metadata recovery."
-    moduleVersion = "v1.4.0-range-dump"
-    moduleVersionCode = 4
+    moduleVersion = "v1.4.1-range-dump-buildfix"
+    moduleVersionCode = 5
 }
