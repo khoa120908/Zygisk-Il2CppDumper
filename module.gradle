@@ -3,7 +3,7 @@ ext {
     magiskModuleId = "zygisk_il2cppdumper"
     moduleName = "Il2CppDumper"
     moduleAuthor = "Perfare"
-    moduleDescription = "Il2CppDumper Zygisk version."
-    moduleVersion = "v1.2.0"
-    moduleVersionCode = 1
+    moduleDescription = "IL2CPP runtime dumper with memory range logging and metadata recovery."
+    moduleVersion = "v1.4.0-range-dump"
+    moduleVersionCode = 4
 }
