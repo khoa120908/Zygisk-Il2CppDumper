@@ -6,6 +6,7 @@
 #include "il2cpp_dump.h"
 #include "metadata_dump.h"
 #include "runtime_dump.h"
+#include "va_dump.h"
 #include "log.h"
 #include "xdl.h"
 #include <cstring>
@@ -49,16 +50,17 @@ void runtime_dump_worker(const char *game_data_dir) {
         LOGW("raw metadata copy failed");
     }
 
-    // Reconstruct libil2cpp twice:
-    //  - libil2cpp.memory.so: RAM mappings only, placed at ELF file offsets.
-    //  - libil2cpp.runtime.so: backing file with readable RAM mappings overlaid.
+    // Reconstruct libil2cpp in both file-offset and VA-layout forms.
     if (!dump_runtime_libil2cpp(game_data_dir)) {
         LOGW("runtime libil2cpp reconstruction failed; check runtime_dump_info.txt/logcat");
+    }
+    if (!dump_va_libil2cpp(game_data_dir)) {
+        LOGW("VA-layout libil2cpp dump failed; check vadump_info.txt/logcat");
     }
 }
 
 void hack_start(const char *game_data_dir) {
-    LOGI("v1.5.0-runtime-rebuild runtime start");
+    LOGI("v1.5.1-vadump runtime start");
     bool load = false;
     for (int i = 0; i < 60; i++) {
         void *handle = xdl_open("libil2cpp.so", 0);
